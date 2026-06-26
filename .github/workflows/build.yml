@@ -1,4 +1,4 @@
-name: Build lemonade 5.4 + KSU-Next
+name: Build lemonade A14 5.4 + KSU-Next
 
 on:
   workflow_dispatch:
@@ -11,17 +11,16 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout this repo
+    - name: Checkout
       uses: actions/checkout@v4
 
-    - name: Load config
+    - name: Load config.env
       run: |
-        source config.env
-        echo "KERNEL_SOURCE=$KERNEL_SOURCE" >> $GITHUB_ENV
-        echo "KERNEL_BRANCH=$KERNEL_BRANCH" >> $GITHUB_ENV
-        echo "KERNEL_CONFIG=$KERNEL_CONFIG" >> $GITHUB_ENV
-        echo "KERNEL_IMAGE_NAME=$KERNEL_IMAGE_NAME" >> $GITHUB_ENV
-        echo "CLANG_VERSION=$CLANG_VERSION" >> $GITHUB_ENV
+        while IFS='=' read -r k v; do
+          [[ "$k" =~ ^# ]] && continue
+          [[ -z "$k" ]] && continue
+          echo "$k=$v" >> $GITHUB_ENV
+        done < config.env
 
     - name: Install deps
       run: |
@@ -31,29 +30,42 @@ jobs:
 
     - name: Clone kernel source
       run: |
-        git clone --depth=1 -b $KERNEL_BRANCH $KERNEL_SOURCE kernel
+        git clone --depth=1 -b "$KERNEL_BRANCH" "$KERNEL_SOURCE" kernel
         cd kernel
+        # 顺手确认 Makefile 的 sublevel
+        head -5 Makefile
         echo "KERNEL_DIR=$PWD" >> $GITHUB_ENV
 
-    - name: Setup Clang (r416183b = Clang 12)
+    - name: Setup Clang r450784d (Clang 14, A14 这棵的配套)
       run: |
         mkdir -p /opt/clang
-        curl -LO https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/tags/android-12.0.0_r1/clang-r416183b.tar.gz
-        tar xf clang-r416183b.tar.gz -C /opt/clang
+        cd /opt/clang
+        # AOSP prebuilts: clang-r450784d (android-14.0.0_r1 那个 tag)
+        curl -fSLo clang.tar.gz "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/tags/android-14.0.0_r1/clang-r450784d.tar.gz"
+        tar xf clang.tar.gz -C /opt/clang
+        rm -f clang.tar.gz
         echo "/opt/clang/bin" >> $GITHUB_PATH
-        clang --version  # 确认 12.x
+        clang --version
 
-    - name: Integrate KSU-Next (legacy, for 5.4)
+    - name: Integrate KSU-Next (legacy, 5.4)
       working-directory: ${{ env.KERNEL_DIR }}
       run: |
         curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s legacy
 
-    - name: Build defconfig + KSU config
+    - name: Defconfig (lahaina_QGKI → 找不到就退 generic arm64)
       working-directory: ${{ env.KERNEL_DIR }}
       run: |
         export PATH="/opt/clang/bin:$PATH"
-        export LLVM_I=1
-        make LLVM=1 LLVM_I=1 vendor/lemonade_defconfig
+        # 先试 lahaina_QGKI（888 公版，一加 9 这棵 A14 树的入口）
+        if [ -f "arch/arm64/configs/$KERNEL_CONFIG" ]; then
+          echo "✅ Using $KERNEL_CONFIG"
+          make LLVM=1 LLVM_I=1 $KERNEL_CONFIG
+        else
+          echo "⚠️ $KERNEL_CONFIG not found, falling back to defconfig (generic arm64)"
+          make LLVM=1 LLVM_I=1 defconfig
+        fi
+
+        # KSU 四项
         ./scripts/config --file .config \
           -e KPROBES \
           -e KPROBE_EVENTS \
@@ -61,7 +73,10 @@ jobs:
           -e KSU
         make LLVM=1 LLVM_I=1 olddefconfig
 
-    - name: Build kernel
+        # 顺手看看 KSU 确实开上了
+        grep -E "KSU|KPROBES" .config | grep -v "^#"
+
+    - name: Build Image.gz-dtb
       working-directory: ${{ env.KERNEL_DIR }}
       run: |
         export PATH="/opt/clang/bin:$PATH"
@@ -72,10 +87,10 @@ jobs:
         git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git ak3
         cp ${{ env.KERNEL_DIR }}/arch/arm64/boot/Image.gz-dtb ak3/
         cd ak3
-        zip -r9 ../lemonade-ksunext-5.4.zip * -x .git README.md
+        zip -r9 ../lemonade-a14-ksunext.zip * -x .git README.md
 
-    - name: Upload artifact
+    - name: Upload
       uses: actions/upload-artifact@v4
       with:
-        name: lemonade-ksunext-5.4
-        path: lemonade-ksunext-5.4.zip
+        name: lemonade-a14-ksunext
+        path: lemonade-a14-ksunext.zip
