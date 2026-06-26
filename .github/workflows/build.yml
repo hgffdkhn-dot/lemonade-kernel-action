@@ -1,0 +1,81 @@
+name: Build lemonade 5.4 + KSU-Next
+
+on:
+  workflow_dispatch:
+
+env:
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout this repo
+      uses: actions/checkout@v4
+
+    - name: Load config
+      run: |
+        source config.env
+        echo "KERNEL_SOURCE=$KERNEL_SOURCE" >> $GITHUB_ENV
+        echo "KERNEL_BRANCH=$KERNEL_BRANCH" >> $GITHUB_ENV
+        echo "KERNEL_CONFIG=$KERNEL_CONFIG" >> $GITHUB_ENV
+        echo "KERNEL_IMAGE_NAME=$KERNEL_IMAGE_NAME" >> $GITHUB_ENV
+        echo "CLANG_VERSION=$CLANG_VERSION" >> $GITHUB_ENV
+
+    - name: Install deps
+      run: |
+        sudo apt update
+        sudo apt install -y bc bison flex libssl-dev make libc6-dev libncurses5-dev \
+          cpio gzip bzip2 zstd git curl python3
+
+    - name: Clone kernel source
+      run: |
+        git clone --depth=1 -b $KERNEL_BRANCH $KERNEL_SOURCE kernel
+        cd kernel
+        echo "KERNEL_DIR=$PWD" >> $GITHUB_ENV
+
+    - name: Setup Clang (r416183b = Clang 12)
+      run: |
+        mkdir -p /opt/clang
+        curl -LO https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/tags/android-12.0.0_r1/clang-r416183b.tar.gz
+        tar xf clang-r416183b.tar.gz -C /opt/clang
+        echo "/opt/clang/bin" >> $GITHUB_PATH
+        clang --version  # 确认 12.x
+
+    - name: Integrate KSU-Next (legacy, for 5.4)
+      working-directory: ${{ env.KERNEL_DIR }}
+      run: |
+        curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s legacy
+
+    - name: Build defconfig + KSU config
+      working-directory: ${{ env.KERNEL_DIR }}
+      run: |
+        export PATH="/opt/clang/bin:$PATH"
+        export LLVM_I=1
+        make LLVM=1 LLVM_I=1 vendor/lemonade_defconfig
+        ./scripts/config --file .config \
+          -e KPROBES \
+          -e KPROBE_EVENTS \
+          -e KSU_KPROBE_HOOKS \
+          -e KSU
+        make LLVM=1 LLVM_I=1 olddefconfig
+
+    - name: Build kernel
+      working-directory: ${{ env.KERNEL_DIR }}
+      run: |
+        export PATH="/opt/clang/bin:$PATH"
+        make LLVM=1 LLVM_I=1 -j$(nproc) Image.gz-dtb
+
+    - name: Package AnyKernel3
+      run: |
+        git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git ak3
+        cp ${{ env.KERNEL_DIR }}/arch/arm64/boot/Image.gz-dtb ak3/
+        cd ak3
+        zip -r9 ../lemonade-ksunext-5.4.zip * -x .git README.md
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: lemonade-ksunext-5.4
+        path: lemonade-ksunext-5.4.zip
