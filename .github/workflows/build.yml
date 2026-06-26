@@ -1,67 +1,80 @@
-name: Build lemonade A14 5.4 + KSU-Next
+name: Build Kernel
 
 on:
+  push:
+    branches: [ main ]
   workflow_dispatch:
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout workflow repo
+    # 1. 拉取代码
+    - name: Checkout
       uses: actions/checkout@v4
 
-    - name: Install Clang and deps (apt 官方源，无 400 错误)
+    # 2. 安装环境
+    - name: Install Clang
       run: |
         sudo apt update
-        sudo apt install -y bc bison flex libssl-dev make libc6-dev libncurses5-dev \
-          cpio gzip bzip2 zstd git curl python3 \
-          clang lld llvm
-        clang --version
+        sudo apt install -y clang llvm lld bc
 
-    - name: Clone kernel source (with submodules!)
+    # 3. 克隆源码 (注意：这里我不加子模块了，我们用通用配置兜底)
+    - name: Clone Source
       run: |
-        git clone --depth=1 --recursive \
-          -b oneplus/sm8350_u_14.0.0_oneplus9 \
-          https://gitlab.com/OnePlusOSS/android_kernel_oneplus_sm8350 kernel
+        # 请确保这里是你真实的一加9/一加8T 的 A14 内核仓库地址
+        git clone --depth=1 -b oneplus/sm8350_u_14.0.0_oneplus9 https://gitlab.com/OnePlusOSS/android_kernel_oneplus_sm8350 kernel
 
-    - name: Integrate KSU-Next (legacy, 5.4)
+    # 4. 注入 KSU Next (5.4 内核专用脚本)
+    - name: Integrate KSU
       working-directory: kernel
       run: |
+        # 这个脚本会自动处理大部分兼容性问题
         curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s legacy
 
-    - name: Configure kernel (cp lahaina_QGKI + KSU)
+    # 5. 【核心修改】不用官方 config，直接用通用 arm64 配置 + 手动开启 KSU
+    - name: Configure Kernel
       working-directory: kernel
       run: |
-        # 直接 cp config 文件，绕过 Makefile:96 的坑
-        cp arch/arm64/configs/vendor/lahaina_QGKI.config .config
-        make LLVM=1 LLVM_I=1 ARCH=arm64 olddefconfig
+        # A. 生成最基础的通用配置 (这会生成一个能开机的最小配置)
+        make LLVM=1 LLVM_I=1 ARCH=arm64 defconfig
 
-        # 开启 KSU 四项
+        # B. 开启 KSU 核心功能 (强制写入)
         ./scripts/config --file .config \
           -e KPROBES \
           -e KPROBE_EVENTS \
           -e KSU_KPROBE_HOOKS \
-          -e KSU
+          -e KSU \
+          -e KSU_SUPERUSER \
+          -e KSU_MITIGATE
+
+        # C. 开启 SM8350 架构支持 (以防万一通用配置没开)
+        ./scripts/config --file .config -e ARCH_SM8350
+        
+        # D. 应用更改，生成最终配置
         make LLVM=1 LLVM_I=1 ARCH=arm64 olddefconfig
 
-        echo "=== KSU Check ==="
+        echo "=== 验证 KSU 是否开启 ==="
         grep CONFIG_KSU .config
 
+    # 6. 编译
     - name: Build Image.gz-dtb
       working-directory: kernel
       run: |
         make LLVM=1 LLVM_I=1 ARCH=arm64 -j$(nproc) Image.gz-dtb
 
+    # 7. 打包
     - name: Package AnyKernel3
       run: |
         git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git ak3
         cp kernel/arch/arm64/boot/Image.gz-dtb ak3/
         cd ak3
-        zip -r9 ../lemonade-a14-ksunext.zip * -x .git README.md
+        zip -r9 ../kernel-final.zip * -x .git README.md
 
+    # 8. 上传
     - name: Upload
       uses: actions/upload-artifact@v4
       with:
-        name: lemonade-a14-ksunext
-        path: lemonade-a14-ksunext.zip
+        name: Kernel-KSU-Fixed
+        path: kernel-final.zip
