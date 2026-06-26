@@ -1,96 +1,101 @@
-name: Build lemonade A14 5.4 + KSU-Next
+name: Build lemonade A14 (5.4 + KSU-Next)
 
 on:
   workflow_dispatch:
+  push:
+    branches: [ main ]
 
 env:
-  TZ: Asia/Shanghai
+  KERNEL_DIR: kernel
+  KERNEL_CONFIG: vendor/lahaina_QGKI.config  # 针对这棵 OSS 树，用 lahaina 基础配置
+  KSU_VERSION: next
+  LLVM_VERSION: 14
 
 jobs:
   build:
     runs-on: ubuntu-latest
-
+    permissions:
+      contents: write
+      actions: write
     steps:
-    - name: Checkout
-      uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-    - name: Load config.env
-      run: |
-        while IFS='=' read -r k v; do
-          [[ "$k" =~ ^# ]] && continue
-          [[ -z "$k" ]] && continue
-          echo "$k=$v" >> $GITHUB_ENV
-        done < config.env
+      - name: Check Clang/Make version
+        run: |
+          clang --version
+          make --version
 
-    - name: Install deps
-      run: |
-        sudo apt update
-        sudo apt install -y bc bison flex libssl-dev make libc6-dev libncurses5-dev \
-          cpio gzip bzip2 zstd git curl python3
+      - name: Setup Clang ($LLVM_VERSION)
+        run: |
+          echo "正在下载 Clang r450784d..."
+          # 使用国内镜像源并增加重试机制
+          for i in 1 2 3; do
+            if wget -q https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+/refs/heads/master/clang-r450784d.tar.gz?format=TEXT | base64 -d > clang.tar.gz && tar -xzf clang.tar.gz && rm clang.tar.gz; then
+              echo "Clang 下载成功！"
+              break
+            else
+              echo "第 $i 次下载失败，重试中..."
+              rm -f clang.tar.gz
+              sleep 5
+            fi
+          done
+          
+          if [ ! -d "clang-r450784d" ]; then
+            echo "::error::Clang 下载彻底失败，请检查网络！"
+            exit 1
+          fi
+          
+          # 将 bin 和 libexec 目录添加到 PATH
+          export PATH=$PWD/clang-r450784d/bin:$PATH
+          export LD_LIBRARY_PATH=$PWD/clang-r450784d/lib:$LD_LIBRARY_PATH
+          echo "PATH=$PATH" >> $GITHUB_ENV
+          clang --version
 
-    - name: Clone kernel source
-      run: |
-        git clone --depth=1 -b "$KERNEL_BRANCH" "$KERNEL_SOURCE" kernel
-        cd kernel
-        # 顺手确认 Makefile 的 sublevel
-        head -5 Makefile
-        echo "KERNEL_DIR=$PWD" >> $GITHUB_ENV
+      - name: Defconfig + KSU config
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          export PATH="/opt/clang/bin:$PATH"
+          
+          # 1. 生成默认配置
+          # 优先尝试 lahaina_QGKI，如果没有则退回通用配置
+          if [ -f "arch/arm64/configs/${{ env.KERNEL_CONFIG }}" ]; then
+            make LLVM=1 LLVM_I=1 ARCH=arm64 ${{ env.KERNEL_CONFIG }}
+          else
+            echo "⚠️ 未找到 ${{ env.KERNEL_CONFIG }}，使用默认 defconfig..."
+            make LLVM=1 LLVM_I=1 ARCH=arm64 defconfig
+          fi
 
-    - name: Setup Clang r450784d (Clang 14, A14 这棵的配套)
-      run: |
-        mkdir -p /opt/clang
-        cd /opt/clang
-        # AOSP prebuilts: clang-r450784d (android-14.0.0_r1 那个 tag)
-        curl -fSLo clang.tar.gz "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/tags/android-14.0.0_r1/clang-r450784d.tar.gz"
-        tar xf clang.tar.gz -C /opt/clang
-        rm -f clang.tar.gz
-        echo "/opt/clang/bin" >> $GITHUB_PATH
-        clang --version
+          # 2. 开启 KSU 和相关调试配置
+          ./scripts/config --file .config \
+            -e KPROBES \
+            -e KPROBE_EVENTS \
+            -e KSU_KPROBE_HOOKS \
+            -e KSU
+          
+          # 确认配置写入
+          ./scripts/config --file .config --state KSU
+          
+          # 3. 更新配置
+          make LLVM=1 LLVM_I=1 ARCH=arm64 olddefconfig
 
-    - name: Integrate KSU-Next (legacy, 5.4)
-      working-directory: ${{ env.KERNEL_DIR }}
-      run: |
-        curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s legacy
+      - name: Build Image.gz-dtb
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          export PATH="/opt/clang/bin:$PATH"
+          make LLVM=1 LLVM_I=1 ARCH=arm64 -j$(nproc) Image.gz-dtb
 
-    - name: Defconfig (lahaina_QGKI → 找不到就退 generic arm64)
-      working-directory: ${{ env.KERNEL_DIR }}
-      run: |
-        export PATH="/opt/clang/bin:$PATH"
-        # 先试 lahaina_QGKI（888 公版，一加 9 这棵 A14 树的入口）
-        if [ -f "arch/arm64/configs/$KERNEL_CONFIG" ]; then
-          echo "✅ Using $KERNEL_CONFIG"
-          make LLVM=1 LLVM_I=1 $KERNEL_CONFIG
-        else
-          echo "⚠️ $KERNEL_CONFIG not found, falling back to defconfig (generic arm64)"
-          make LLVM=1 LLVM_I=1 defconfig
-        fi
+      - name: Package AnyKernel3
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git ak3
+          cp ${{ env.KERNEL_DIR }}/arch/arm64/boot/Image.gz-dtb ak3/
+          cd ak3
+          zip -r9 ../lemonade-a14-ksunext.zip * -x .git README.md
 
-        # KSU 四项
-        ./scripts/config --file .config \
-          -e KPROBES \
-          -e KPROBE_EVENTS \
-          -e KSU_KPROBE_HOOKS \
-          -e KSU
-        make LLVM=1 LLVM_I=1 olddefconfig
-
-        # 顺手看看 KSU 确实开上了
-        grep -E "KSU|KPROBES" .config | grep -v "^#"
-
-    - name: Build Image.gz-dtb
-      working-directory: ${{ env.KERNEL_DIR }}
-      run: |
-        export PATH="/opt/clang/bin:$PATH"
-        make LLVM=1 LLVM_I=1 -j$(nproc) Image.gz-dtb
-
-    - name: Package AnyKernel3
-      run: |
-        git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git ak3
-        cp ${{ env.KERNEL_DIR }}/arch/arm64/boot/Image.gz-dtb ak3/
-        cd ak3
-        zip -r9 ../lemonade-a14-ksunext.zip * -x .git README.md
-
-    - name: Upload
-      uses: actions/upload-artifact@v4
-      with:
-        name: lemonade-a14-ksunext
-        path: lemonade-a14-ksunext.zip
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: lemonade-a14-ksunext
+          path: lemonade-a14-ksunext.zip
