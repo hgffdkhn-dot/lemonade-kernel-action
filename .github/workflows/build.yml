@@ -1,79 +1,98 @@
-name: Build lemonade A14 5.4 + KSU-Next
+name: 构建柠檬水 A14 (5.4 + KSU-Next)
 
 on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
   workflow_dispatch:
 
 env:
-  TZ: Asia/Shanghai
+  KERNEL_DIR: kernel
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
 
     steps:
-    - name: Checkout
-      uses: actions/checkout@v4
+      - name: 检出代码 (Checkout)
+        uses: actions/checkout@v4
+        with:
+          submodules: 'true'  # 关键：这里设置为 true，让 Actions 自动拉取子模块
+          fetch-depth: 0
 
-    - name: Install deps & Clang 14 (apt 官方源，无 400)
-      run: |
-        sudo apt update
-        sudo apt install -y bc bison flex libssl-dev make libc6-dev libncurses5-dev \
-          cpio gzip bzip2 zstd git curl python3 \
-          clang lld llvm
-        clang --version
-        ld.lld --version
+      - name: 安装依赖 & Clang
+        run: |
+          sudo apt update
+          sudo apt install -y clang llvm lld make bc zip
 
-    - name: Clone kernel source
-      run: |
-        git clone --depth=1 -b oneplus/sm8350_u_14.0.0_oneplus9 \
-          https://gitlab.com/OnePlusOSS/android_kernel_oneplus_sm8350 kernel
-        cd kernel
-        echo "=== Kernel version ==="
-        head -5 Makefile
-        echo "=== vendor/ configs check ==="
-        ls -lh arch/arm64/configs/vendor/lahaina_QGKI.config || echo "FILE NOT FOUND"
-        echo "KERNEL_DIR=$PWD" >> $GITHUB_ENV
+      - name: 设置 Clang
+        run: |
+          # 定义重试次数
+          max_retries=5
+          retry_count=0
+          success=false
 
-    - name: Integrate KSU-Next (legacy, 5.4)
-      working-directory: ${{ env.KERNEL_DIR }}
-      run: |
-        curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s legacy
+          while [ $retry_count -lt $max_retries ]; do
+            echo "第 $((retry_count + 1)) 次尝试下载 Clang..."
+            
+            # 使用 apt 安装 clang，不再使用容易 400 报错的 curl 脚本
+            if sudo apt install -y clang llvm lld; then
+              echo "Clang 安装成功！"
+              success=true
+              break
+            else
+              echo "安装失败，等待 10 秒后重试..."
+              retry_count=$((retry_count + 1))
+              sleep 10
+            fi
+          done
 
-    - name: Defconfig (cp 大法绕开 Makefile:96)
-      working-directory: ${{ env.KERNEL_DIR }}
-      run: |
-        # 这棵 A14 树的 %config 规则被 OPlus 改过，vendor/xxx.config 走 %config 会 96 报错
-        # 直接 cp 当 .config 再 olddefconfig，完全避开 %config 目标
-        cp arch/arm64/configs/vendor/lahaina_QGKI.config .config
-        make LLVM=1 LLVM_I=1 ARCH=arm64 olddefconfig
+          if [ "$success" = false ]; then
+            echo "::error::Clang 安装彻底失败！"
+            exit 1
+          fi
 
-        # KSU 四项
-        ./scripts/config --file .config \
-          -e KPROBES \
-          -e KPROBE_EVENTS \
-          -e KSU_KPROBE_HOOKS \
-          -e KSU
-        make LLVM=1 LLVM_I=1 ARCH=arm64 olddefconfig
+      - name: Defconfig + KSU config
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          # 1. 清理旧的 .config，避免缓存干扰
+          rm -f .config
+          
+          # 2. 生成默认配置
+          # 注意：如果你的 defconfig 文件名不同，请在这里修改
+          make LLVM=1 LLVM_I=1 ARCH=arm64 defconfig
 
-        echo "=== KSU Config Check ==="
-        grep -E "CONFIG_KSU|CONFIG_KPROBES" .config | grep -v "^#"
-        echo "=== ARCH_SM8350 Check ==="
-        grep "CONFIG_ARCH_SM8350" .config | grep -v "^#"
+          # 3. 开启 KSU 核心功能
+          ./scripts/config --file .config \
+            -e KPROBES \
+            -e KPROBE_EVENTS \
+            -e KSU_KPROBE_HOOKS \
+            -e KSU
+          
+          # 4. 更新配置
+          make LLVM=1 LLVM_I=1 ARCH=arm64 olddefconfig
 
-    - name: Build Image.gz-dtb
-      working-directory: ${{ env.KERNEL_DIR }}
-      run: |
-        make LLVM=1 LLVM_I=1 ARCH=arm64 -j$(nproc) Image.gz-dtb
+          echo "=== KSU Config Check ==="
+          grep -E "CONFIG_KSU|CONFIG_KPROBES" .config | grep -v "^#"
 
-    - name: Package AnyKernel3
-      run: |
-        git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git ak3
-        cp ${{ env.KERNEL_DIR }}/arch/arm64/boot/Image.gz-dtb ak3/
-        cd ak3
-        zip -r9 ../lemonade-a14-ksunext.zip * -x .git README.md
+      - name: Build Image.gz-dtb
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          make LLVM=1 LLVM_I=1 ARCH=arm64 -j$(nproc) Image.gz-dtb
 
-    - name: Upload
-      uses: actions/upload-artifact@v4
-      with:
-        name: lemonade-a14-ksunext
-        path: lemonade-a14-ksunext.zip
+      - name: Package AnyKernel3
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git ak3
+          cp ${{ env.KERNEL_DIR }}/arch/arm64/boot/Image.gz-dtb ak3/
+          cd ak3
+          zip -r9 ../lemonade-a14-ksunext.zip * -x .git README.md
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: lemonade-a14-ksunext
+          path: lemonade-a14-ksunext.zip
