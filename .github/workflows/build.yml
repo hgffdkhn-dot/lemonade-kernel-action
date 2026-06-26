@@ -14,21 +14,24 @@ jobs:
     - name: Checkout
       uses: actions/checkout@v4
 
-    - name: Install deps & Clang 14 (apt 官方源，无 400 错误)
+    - name: Install deps & Clang 14 (apt 官方源，无 400)
       run: |
         sudo apt update
         sudo apt install -y bc bison flex libssl-dev make libc6-dev libncurses5-dev \
           cpio gzip bzip2 zstd git curl python3 \
           clang lld llvm
-        # 确认版本（ubuntu-22.04 默认就是 clang 14）
         clang --version
         ld.lld --version
 
     - name: Clone kernel source
       run: |
-        git clone --depth=1 -b oneplus/sm8350_u_14.0.0_oneplus9 https://gitlab.com/OnePlusOSS/android_kernel_oneplus_sm8350 kernel
+        git clone --depth=1 -b oneplus/sm8350_u_14.0.0_oneplus9 \
+          https://gitlab.com/OnePlusOSS/android_kernel_oneplus_sm8350 kernel
         cd kernel
+        echo "=== Kernel version ==="
         head -5 Makefile
+        echo "=== vendor/ configs check ==="
+        ls -lh arch/arm64/configs/vendor/lahaina_QGKI.config || echo "FILE NOT FOUND"
         echo "KERNEL_DIR=$PWD" >> $GITHUB_ENV
 
     - name: Integrate KSU-Next (legacy, 5.4)
@@ -36,19 +39,15 @@ jobs:
       run: |
         curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s legacy
 
-    - name: Defconfig + KSU config
+    - name: Defconfig (cp 大法绕开 Makefile:96)
       working-directory: ${{ env.KERNEL_DIR }}
       run: |
-        # 优先尝试 lahaina_QGKI.config，找不到就退回通用 defconfig
-        if [ -f "arch/arm64/configs/vendor/lahaina_QGKI.config" ]; then
-          echo "✅ Using vendor/lahaina_QGKI.config"
-          make LLVM=1 LLVM_I=1 ARCH=arm64 vendor/lahaina_QGKI.config
-        else
-          echo "⚠️ vendor/lahaina_QGKI.config not found, falling back to defconfig"
-          make LLVM=1 LLVM_I=1 ARCH=arm64 defconfig
-        fi
+        # 这棵 A14 树的 %config 规则被 OPlus 改过，vendor/xxx.config 走 %config 会 96 报错
+        # 直接 cp 当 .config 再 olddefconfig，完全避开 %config 目标
+        cp arch/arm64/configs/vendor/lahaina_QGKI.config .config
+        make LLVM=1 LLVM_I=1 ARCH=arm64 olddefconfig
 
-        # 开启 KSU 四项
+        # KSU 四项
         ./scripts/config --file .config \
           -e KPROBES \
           -e KPROBE_EVENTS \
@@ -56,9 +55,10 @@ jobs:
           -e KSU
         make LLVM=1 LLVM_I=1 ARCH=arm64 olddefconfig
 
-        # 确认 KSU 写入成功
         echo "=== KSU Config Check ==="
         grep -E "CONFIG_KSU|CONFIG_KPROBES" .config | grep -v "^#"
+        echo "=== ARCH_SM8350 Check ==="
+        grep "CONFIG_ARCH_SM8350" .config | grep -v "^#"
 
     - name: Build Image.gz-dtb
       working-directory: ${{ env.KERNEL_DIR }}
